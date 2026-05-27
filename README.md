@@ -119,6 +119,16 @@ Runtime of a single E-step (K=1024, D=128, A100 80GB):
 
 TorchGMM runs out of memory beyond N≈1M. Flash-GMM scales to N=10⁸ on the same device.
 
+## Authors
+
+- Gal Bloch (gal.bloch@ibm.com)
+- Assaf Toledo (assaf.toledo@ibm.com)
+- Ohad Eytan (ohad.eytan1@ibm.com)
+- Ariel Gera (ariel.gera1@ibm.com)
+- Matan Orbach (matano@il.ibm.com)
+
+IBM Research
+
 ## Citation
 
 If you use Flash-GMM in your research, please cite:
@@ -127,7 +137,7 @@ If you use Flash-GMM in your research, please cite:
 @article{bloch2026flashgmm,
   title     = {Flash-GMM: Breaking the Memory Barrier for Large-Scale
                Gaussian Mixture Models, with Applications to IVF Indexing},
-  author    = {Bloch, Gal},
+  author    = {Bloch, Gal and Toledo, Assaf and Eytan, Ohad and Gera, Ariel and Orbach, Matan},
   journal   = {arXiv preprint},
   year      = {2026}
 }
