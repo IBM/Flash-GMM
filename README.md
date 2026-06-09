@@ -121,15 +121,9 @@ TorchGMM runs out of memory beyond N≈1M. Flash-GMM scales to N=10⁸ on the sa
 
 ## H100-Tuned Variants
 
-Three additional kernels are tuned for NVIDIA H100 on the paper benchmark workloads (K=1024, D=96–128). They run **more than 5× faster than `flash_gmm.py`** there — combined with the paper's ~20× advantage over TorchGMM, **roughly 100× over TorchGMM**. Outside the tuned envelope they may regress.
+For NVIDIA H100 on the paper benchmark workloads (K=1024, D=96–128), we ship kernels tuned for those specific shapes that run **roughly 100× faster than TorchGMM**: [`flash_gmm_h100.py`](flash_gmm_h100.py), [`flash_gmm_diag_h100.py`](flash_gmm_diag_h100.py), [`flash_gmm_full_h100.py`](flash_gmm_full_h100.py).
 
-| File | Covariance |
-|---|---|
-| [`flash_gmm_h100.py`](flash_gmm_h100.py) | Isotropic |
-| [`flash_gmm_diag_h100.py`](flash_gmm_diag_h100.py) | Diagonal |
-| [`flash_gmm_full_h100.py`](flash_gmm_full_h100.py) | Full (Cholesky factor of precision) |
-
-For shapes far from the paper benchmarks, or for non-H100 GPUs, use `flash_gmm.py`.
+For shapes far from the paper benchmarks, or non-H100 GPUs, use `flash_gmm.py`.
 
 ## Authors
 
