@@ -1,64 +1,47 @@
 """
-Flash-GMM E-step (full covariance) — H100-tuned with split-K persistent pass 2.
+Flash-GMM E-step (full covariance) — two-launch atomic kernel.
 
-Two Triton launches:
-  Pass 1: tiled online log-sum-exp over K  -> writes logZ to HBM (in log2 space)
-  Pass 2: split-K persistent — responsibilities + 3 atomic_adds per CTA
+A correct, conservatively-sized full-covariance variant. The N×K×D×D
+sufficient-statistic stream is processed without ever materializing the
+N×K responsibility matrix.
 
-The N x K responsibility matrix is never materialized.
-
-Per-component covariance is full (D x D). The kernel takes the Cholesky factor
-L_k of the *precision* matrix:
+Per-component covariance is full (D x D). Input is the lower-triangular
+Cholesky factor `prec_chol[k] = L_k` of the precision matrix:
 
     Σ_k^{-1} = L_k L_k^T,   L_k lower-triangular
 
-Math, derived for WGMMA-friendly inner loops:
+so the squared Mahalanobis distance has the cheap form
 
-    || L_k^T (x - μ_k) ||²
-        = (x - μ_k)^T Σ_k^{-1} (x - μ_k)
-        = x^T Σ_k^{-1} x  -  2 μ_k^T Σ_k^{-1} x  +  μ_k^T Σ_k^{-1} μ_k
+    || L_k^T (x - μ_k) ||² = (x - μ_k)^T Σ_k^{-1} (x - μ_k)
 
-    Define:
-        prec_flat[k, d1*D + d2] = (Σ_k^{-1})[d1, d2]            (K, D²) — host-precomp
-        mu_w[k, d]              = (Σ_k^{-1} μ_k)[d]              (K, D)  — host-precomp
-        mu_quad[k]              = μ_k^T Σ_k^{-1} μ_k             (K,)    — host-precomp
+and the half-log-determinant of the precision is Σ_d log L_kdd.
 
-    Then for each (n, k):
-        quad[n, k]   = Σ_{d1,d2} x[n,d1] · x[n,d2] · prec_flat[k, d1*D+d2]
-        linear[n, k] = Σ_d x[n, d] · mu_w[k, d]
-        maha[n, k]   = quad[n, k]  -  2 · linear[n, k]  +  mu_quad[k]
+Two Triton launches:
+  Pass 1: tiled online log-sum-exp over K   →  writes logZ to HBM (log2 space)
+  Pass 2: re-reads X, computes responsibilities, atomic-adds Nk / mu_acc /
+          sig_outer into O(K + KD + KD²) global buffers.
 
-    The TWO matmuls are clean WGMMA:
-        (BLOCK_N, D²)   @   (D², BLOCK_K)   →   (BLOCK_N, BLOCK_K)   for quad
-        (BLOCK_N, D)    @   (D,  BLOCK_K)   →   (BLOCK_N, BLOCK_K)   for linear
+The N×K responsibility matrix is never materialized.
 
-    The constant μ_k^T Σ_k^{-1} μ_k folds into c0[k].
+Design notes — why this kernel is intentionally conservative:
 
-Optimizations vs the previous version:
+  * **Per-d2 runtime loop** (not `tl.static_range`). Avoids exploding the
+    SMEM budget under multi-stage pipelining when BLOCK_D is large
+    (BLOCK_D=128 unrolled × num_stages=3 stages of `LT_d2` panels would
+    request ~3 MB SMEM, well over H100's ~228 KB / SM).
+  * **Single autotune config.** Triton autotune over many configs adds
+    minutes of compile time on first call. This kernel uses one fixed,
+    safe (BLOCK_N, BLOCK_K) tile so the first call is fast.
+  * **Standard atomic-add accumulation** in pass 2 (no split-K). For
+    K=1024, D=128 the (K, D, D) sig_outer buffer has 16M cells; atomic
+    contention is bounded.
 
-  1. Pre-transpose prec_flat → (D², K) and mu_w → (D, K). Inner-loop matmuls
-     become direct WGMMA-friendly contractions.
-  2. Split-K persistent pass 2:
-       Grid = (cdiv(K, BLOCK_K), N_SPLIT)
-       Each CTA owns one K-block and a contiguous N-slab. It iterates over
-       its N rows in chunks of BLOCK_N, accumulating nk_local / mu_local /
-       sig_local in REGISTERS. After the entire N-slab is processed it does
-       exactly THREE atomic_adds per CTA (Nk, mu_acc, sig_outer).
-     vs the prior cdiv(N,BN) * cdiv(K,BK) atomic groups. For Deep10M roughly
-     78k * 8 atomic groups → ~256 groups, a >2000x reduction in atomic
-     contention on the (K, D, D) sig_outer buffer.
-  3. K_EXACT constexpr drops K-mask paths when K%256==0 (always true here).
-  4. exp2/log2 — H100 SFU has dedicated exp2 instruction.
-
-Same math as the previous full-cov kernel; same numerical envelope. Output
-tensors are re-allocated fresh on every call.
+This kernel prioritizes correctness and cold-start latency over peak
+throughput. It's the right starting point for an agent to optimize.
 
 Entry point (DO NOT RENAME):
     flash_gmm_estep_full(X, mu, prec_chol, log_pi)
         -> (logZ, Nk, mu_acc, sig_outer)
-
-where prec_chol[k] is the lower-triangular Cholesky factor of Σ_k^{-1}.
-The reconstructed precision matrix Σ⁻¹ = L Lᵀ is what enters the kernel.
 """
 
 from __future__ import annotations
@@ -70,110 +53,81 @@ import triton
 import triton.language as tl
 
 
+_LOG_2PI = 1.8378770664093453
+_LOG2_E  = 1.4426950408889634
+
+# NOTE: Triton @jit kernel bodies CANNOT access these module-level globals.
+# Inside @triton.jit functions we inline the float literal `1.4426950408889634`
+# (which equals log2(e)) directly. Do NOT extract it to a module constant —
+# Triton will raise NameError("Cannot access global variable ... from within
+# @jit'ed function"). If you really want a named constant, pass it as a
+# kernel argument or use `tl.constexpr` typing on a *kernel parameter*.
+
+
 # --------------------------------------------------------------------
-# Pass 1 autotune (grid over N)
+# Pass 1: per-N-tile online log-sum-exp over K
 # --------------------------------------------------------------------
 
-def _pass1_configs():
-    cfgs = [
-        # (BLOCK_N, BLOCK_K, num_warps, num_stages)
-        (64,  64, 4, 3),
-        (64, 128, 4, 3),
-        (128, 64, 4, 3),  (128, 64, 8, 3),
-        (128,128, 8, 3),  (128,128, 8, 4),
-        (128,256, 8, 3),
-        (256, 64, 8, 3),  (256, 64, 8, 4),
-        (256,128, 8, 3),  (256,128, 8, 4),
-    ]
-    return [
-        triton.Config({"BLOCK_N": bn, "BLOCK_K": bk}, num_warps=nw, num_stages=ns)
-        for (bn, bk, nw, ns) in cfgs
-    ]
-
-
-@triton.autotune(configs=_pass1_configs(), key=["N", "K", "D", "BLOCK_D", "DD", "K_EXACT"])
 @triton.jit
 def _full_lse_kernel(
-    X_ptr, prec_flatT_ptr, mu_wT_ptr, c0_ptr,
+    X_ptr, LT_ptr, LT_mu_ptr, c0_ptr,
     logZ2_ptr,
     N, K, D,
     stride_xn, stride_xd,
-    stride_pdT_dd, stride_pdT_k,
-    stride_mwT_d, stride_mwT_k,
+    stride_LTk, stride_LTd2, stride_LTd1,
+    stride_LTmk, stride_LTmd,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    DD: tl.constexpr,        # = BLOCK_D * BLOCK_D — flattened precision width
-    K_EXACT: tl.constexpr,
 ):
-    """
-    Pass 1: tiled online log-sum-exp over K.
-
-    Inputs (host-precomputed):
-      prec_flatT[d1*D+d2, k] = (Σ_k^{-1})[d1, d2]                (D², K) bf16
-      mu_wT[d, k]            = (Σ_k^{-1} μ_k)[d]                  (D,  K) bf16
-      c0[k]                  = ( log_pi + Σ log L_kdd
-                                 - 0.5·D·log(2π)
-                                 - 0.5 · μ_k^T Σ^{-1} μ_k ) · log2_e   (K,) fp32
-
-    For each (n, k) the log2-likelihood is
-        ll2[n,k] = c0[k]
-                   - 0.5 · log2_e · ( quad[n,k] - 2 · linear[n,k] )
-        quad[n,k]   = Σ_{d1,d2} (x[n,d1]·x[n,d2]) · prec_flat[k, d1·D+d2]
-        linear[n,k] = Σ_d x[n,d] · mu_w[k,d]
+    """For each (n, k) compute
+        v_d2[n, k] = (LT[k, d2, :] · x[n, :]) - LT_mu[k, d2]
+        maha[n, k] = Σ_{d2} v_d2²
+        ll2[n, k]  = c0[k] - 0.5·log2_e · maha[n, k]   (log2 units)
+    accumulating ll2 into an online log-sum-exp over K, writing logZ2[n].
     """
     pid = tl.program_id(0)
     n_off = (pid * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
     n_mask = n_off < N
-    d_off  = tl.arange(0, BLOCK_D)
-    dd_off = tl.arange(0, DD)
+    d_off = tl.arange(0, BLOCK_D)
 
-    # Load X tile (BLOCK_N, BLOCK_D); padded host-side so no d-mask needed
     x = tl.load(
         X_ptr + n_off[:, None] * stride_xn + d_off[None, :] * stride_xd,
         mask=n_mask[:, None], other=0.0,
-    )
+    )                                                            # (BLOCK_N, BLOCK_D)
     x_bf = x.to(tl.bfloat16)
-
-    # Outer product per row: xx[n, d1*D + d2] = x[n, d1] * x[n, d2]
-    # Materialize as (BLOCK_N, BLOCK_D, BLOCK_D) then reshape — one register tile.
-    xx = x[:, :, None] * x[:, None, :]                          # (BLOCK_N, BLOCK_D, BLOCK_D) fp32
-    xx_flat = tl.reshape(xx, (BLOCK_N, DD)).to(tl.bfloat16)     # (BLOCK_N, DD) bf16
 
     running_max = tl.full([BLOCK_N], float('-inf'), dtype=tl.float32)
     running_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
 
     for k0 in range(0, K, BLOCK_K):
         k_off = k0 + tl.arange(0, BLOCK_K)
+        k_mask = k_off < K
 
-        if K_EXACT:
-            # Two BF16 matmuls — both clean WGMMA on H100
-            prec_blk = tl.load(
-                prec_flatT_ptr + dd_off[:, None] * stride_pdT_dd + k_off[None, :] * stride_pdT_k
-            )
-            mu_w_blk = tl.load(
-                mu_wT_ptr + d_off[:, None] * stride_mwT_d + k_off[None, :] * stride_mwT_k
-            )
-            c0 = tl.load(c0_ptr + k_off)
-        else:
-            k_mask = k_off < K
-            prec_blk = tl.load(
-                prec_flatT_ptr + dd_off[:, None] * stride_pdT_dd + k_off[None, :] * stride_pdT_k,
-                mask=k_mask[None, :], other=0.0,
-            )
-            mu_w_blk = tl.load(
-                mu_wT_ptr + d_off[:, None] * stride_mwT_d + k_off[None, :] * stride_mwT_k,
-                mask=k_mask[None, :], other=0.0,
-            )
-            c0 = tl.load(c0_ptr + k_off, mask=k_mask, other=float('-inf'))
+        c0 = tl.load(c0_ptr + k_off, mask=k_mask, other=float('-inf'))
 
-        quad   = tl.dot(xx_flat, prec_blk, out_dtype=tl.float32)   # (BLOCK_N, BLOCK_K)
-        linear = tl.dot(x_bf,    mu_w_blk, out_dtype=tl.float32)   # (BLOCK_N, BLOCK_K)
-        # ll2 in log2 space: c0 already includes the 0.5·log2_e·μ^TΣ⁻¹μ correction
-        ll2 = c0[None, :] - (0.5 * 1.4426950408889634) * (quad - 2.0 * linear)
+        maha = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
+        # Runtime d2 loop — does NOT unroll; bounds SMEM under pipelining.
+        for d2 in range(BLOCK_D):
+            LT_d2 = tl.load(
+                LT_ptr
+                + k_off[:, None] * stride_LTk
+                + d2 * stride_LTd2
+                + d_off[None, :] * stride_LTd1,
+                mask=k_mask[:, None], other=0.0,
+            )                                                    # (BLOCK_K, BLOCK_D) BF16
+            LT_mu_d2 = tl.load(
+                LT_mu_ptr + k_off * stride_LTmk + d2 * stride_LTmd,
+                mask=k_mask, other=0.0,
+            )                                                    # (BLOCK_K,) FP32
 
-        if not K_EXACT:
-            ll2 = tl.where(k_mask[None, :], ll2, float('-inf'))
+            # v_d2 = x · LT_d2.T - LT_mu_d2     (BLOCK_N, BLOCK_K)
+            v_d2 = tl.dot(x_bf, tl.trans(LT_d2), out_dtype=tl.float32)
+            v_d2 = v_d2 - LT_mu_d2[None, :]
+            maha += v_d2 * v_d2
+
+        ll2 = c0[None, :] - (0.5 * 1.4426950408889634) * maha  # 0.5 · log2(e)
+        ll2 = tl.where(k_mask[None, :], ll2, float('-inf'))
 
         block_max = tl.max(ll2, axis=1)
         new_max = tl.maximum(running_max, block_max)
@@ -186,166 +140,97 @@ def _full_lse_kernel(
 
 
 # --------------------------------------------------------------------
-# Pass 2: split-K persistent kernel
-#   Grid = (n_k_blocks, n_splits)
-#   Each CTA owns one K-block and a contiguous N-slab.
+# Pass 2: per-(N-tile, K-tile) atomic accumulation
 # --------------------------------------------------------------------
 
-def _pass2_configs():
-    # sig_local is (BLOCK_K, BLOCK_D, BLOCK_D) fp32 — biggest live value.
-    # At BLOCK_K=8, BLOCK_D=128: 8 * 128 * 128 * 4 = 512 KB → too big for regs.
-    # H100 register file is 256 KB / SM. Keep BLOCK_K small for full-cov.
-    cfgs = [
-        # (BLOCK_N, BLOCK_K, num_warps, num_stages)
-        (64,  4, 4, 3),  (64,  4, 8, 3),
-        (64,  8, 4, 3),  (64,  8, 8, 3),
-        (128, 4, 4, 3),  (128, 4, 8, 3),  (128, 4, 8, 4),
-        (128, 8, 8, 3),  (128, 8, 8, 4),
-        (256, 4, 8, 3),  (256, 4, 8, 4),
-    ]
-    return [
-        triton.Config({"BLOCK_N": bn, "BLOCK_K": bk}, num_warps=nw, num_stages=ns)
-        for (bn, bk, nw, ns) in cfgs
-    ]
-
-
-@triton.autotune(
-    configs=_pass2_configs(),
-    key=["N", "K", "D", "BLOCK_D", "DD", "K_EXACT", "N_SPLIT"],
-    reset_to_zero=["Nk_ptr", "mu_acc_ptr", "sig_outer_ptr"],
-)
 @triton.jit
-def _full_split_k_accum(
-    X_ptr, prec_flatT_ptr, mu_wT_ptr, c0_ptr, logZ2_ptr,
+def _full_atomic_accum(
+    X_ptr, LT_ptr, LT_mu_ptr, c0_ptr, logZ2_ptr,
     Nk_ptr, mu_acc_ptr, sig_outer_ptr,
-    N, K, D, N_SPLIT,
+    N, K, D,
     stride_xn, stride_xd,
-    stride_pdT_dd, stride_pdT_k,
-    stride_mwT_d, stride_mwT_k,
+    stride_LTk, stride_LTd2, stride_LTd1,
+    stride_LTmk, stride_LTmd,
     stride_ma_k, stride_ma_d,
     stride_so_k, stride_so_d1, stride_so_d2,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    DD: tl.constexpr,
-    K_EXACT: tl.constexpr,
 ):
-    k_pid = tl.program_id(0)
-    n_pid = tl.program_id(1)
+    """Re-reads X, recomputes maha for THIS K-tile, computes responsibilities,
+    accumulates into Nk / mu_acc / sig_outer via atomic_add."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
 
-    k_off  = (k_pid * BLOCK_K + tl.arange(0, BLOCK_K)).to(tl.int64)
-    d_off  = tl.arange(0, BLOCK_D)
-    dd_off = tl.arange(0, DD)
+    n_off = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    n_mask = n_off < N
+    k_off = (pid_k * BLOCK_K + tl.arange(0, BLOCK_K)).to(tl.int64)
+    k_mask = k_off < K
+    d_off = tl.arange(0, BLOCK_D)
 
-    if K_EXACT:
-        prec_blk = tl.load(
-            prec_flatT_ptr + dd_off[:, None] * stride_pdT_dd + k_off[None, :] * stride_pdT_k
+    x = tl.load(
+        X_ptr + n_off[:, None] * stride_xn + d_off[None, :] * stride_xd,
+        mask=n_mask[:, None], other=0.0,
+    )
+    log_Z2 = tl.load(logZ2_ptr + n_off, mask=n_mask, other=0.0)
+    x_bf = x.to(tl.bfloat16)
+    c0   = tl.load(c0_ptr + k_off, mask=k_mask, other=float('-inf'))
+
+    maha = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
+    for d2 in range(BLOCK_D):
+        LT_d2 = tl.load(
+            LT_ptr
+            + k_off[:, None] * stride_LTk
+            + d2 * stride_LTd2
+            + d_off[None, :] * stride_LTd1,
+            mask=k_mask[:, None], other=0.0,
         )
-        mu_w_blk = tl.load(
-            mu_wT_ptr + d_off[:, None] * stride_mwT_d + k_off[None, :] * stride_mwT_k
+        LT_mu_d2 = tl.load(
+            LT_mu_ptr + k_off * stride_LTmk + d2 * stride_LTmd,
+            mask=k_mask, other=0.0,
         )
-        c0 = tl.load(c0_ptr + k_off)
-    else:
-        k_mask_active = k_off < K
-        prec_blk = tl.load(
-            prec_flatT_ptr + dd_off[:, None] * stride_pdT_dd + k_off[None, :] * stride_pdT_k,
-            mask=k_mask_active[None, :], other=0.0,
-        )
-        mu_w_blk = tl.load(
-            mu_wT_ptr + d_off[:, None] * stride_mwT_d + k_off[None, :] * stride_mwT_k,
-            mask=k_mask_active[None, :], other=0.0,
-        )
-        c0 = tl.load(c0_ptr + k_off, mask=k_mask_active, other=float('-inf'))
+        v_d2 = tl.dot(x_bf, tl.trans(LT_d2), out_dtype=tl.float32)
+        v_d2 = v_d2 - LT_mu_d2[None, :]
+        maha += v_d2 * v_d2
 
-    chunk = (N + N_SPLIT - 1) // N_SPLIT
-    n_start = n_pid * chunk
-    n_end   = n_start + chunk
+    ll2 = c0[None, :] - (0.5 * 1.4426950408889634) * maha  # 0.5 · log2(e)
+    ll2 = tl.where(n_mask[:, None] & k_mask[None, :], ll2, float('-inf'))
+    r = tl.exp2(ll2 - log_Z2[:, None])                         # (BLOCK_N, BLOCK_K) FP32
+    r = tl.where(n_mask[:, None] & k_mask[None, :], r, 0.0)
+    r_bf = r.to(tl.bfloat16)
 
-    # Local accumulators in fp32 — kept in registers across the inner N-loop.
-    nk_local  = tl.zeros([BLOCK_K], dtype=tl.float32)
-    mu_local  = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
-    # sig_local is the SECOND MOMENT (uncentered):  Σ_i r_ik · x_i x_i^T
-    # Stored flat (BLOCK_K, DD) and unflattened on store. Same memory either way.
-    sig_local = tl.zeros([BLOCK_K, DD], dtype=tl.float32)
+    # Nk += sum over n
+    nk_block = tl.sum(r, axis=0)                                # (BLOCK_K,)
+    tl.atomic_add(Nk_ptr + k_off, nk_block, mask=k_mask)
 
-    for n0 in range(n_start, n_end, BLOCK_N):
-        n_off = (n0 + tl.arange(0, BLOCK_N)).to(tl.int64)
-        n_mask = n_off < N
+    # mu_acc += r.T @ x        (BLOCK_K, BLOCK_D)
+    mu_block = tl.dot(tl.trans(r_bf), x_bf, out_dtype=tl.float32)
+    tl.atomic_add(
+        mu_acc_ptr + k_off[:, None] * stride_ma_k + d_off[None, :] * stride_ma_d,
+        mu_block, mask=k_mask[:, None],
+    )
 
-        x = tl.load(
-            X_ptr + n_off[:, None] * stride_xn + d_off[None, :] * stride_xd,
-            mask=n_mask[:, None], other=0.0,
-        )
-        log_Z2 = tl.load(logZ2_ptr + n_off, mask=n_mask, other=0.0)
-        x_bf = x.to(tl.bfloat16)
+    # sig_outer[k, d1, d2] += Σ_n r[n, k] · x[n, d1] · x[n, d2]
+    # Stream over d2 with runtime loop; per-d2 is a (BLOCK_K, BLOCK_D) row
+    # written via one atomic_add of size (BLOCK_K, BLOCK_D).
+    for d2 in range(BLOCK_D):
+        x_d2 = tl.load(
+            X_ptr + n_off * stride_xn + d2 * stride_xd,
+            mask=n_mask, other=0.0,
+        )                                                       # (BLOCK_N,)
+        rx_d2_bf = (r * x_d2[:, None]).to(tl.bfloat16)          # (BLOCK_N, BLOCK_K)
+        sig_d2_row = tl.dot(tl.trans(rx_d2_bf), x_bf, out_dtype=tl.float32)
+        # (BLOCK_K, BLOCK_D)
 
-        # Same outer product as pass 1
-        xx = x[:, :, None] * x[:, None, :]
-        xx_flat = tl.reshape(xx, (BLOCK_N, DD)).to(tl.bfloat16)
-
-        # Recompute ll2 for THIS K-block
-        quad   = tl.dot(xx_flat, prec_blk, out_dtype=tl.float32)
-        linear = tl.dot(x_bf,    mu_w_blk, out_dtype=tl.float32)
-        ll2 = c0[None, :] - (0.5 * 1.4426950408889634) * (quad - 2.0 * linear)
-        ll2 = tl.where(n_mask[:, None], ll2, float('-inf'))
-
-        # Responsibilities
-        r = tl.exp2(ll2 - log_Z2[:, None])             # (BLOCK_N, BLOCK_K) fp32
-        r_bf = r.to(tl.bfloat16)
-
-        # Accumulate
-        nk_local  += tl.sum(r, axis=0)                                          # (BLOCK_K,)
-        mu_local  += tl.dot(tl.trans(r_bf), x_bf,    out_dtype=tl.float32)      # (BLOCK_K, BLOCK_D)
-        # sig_local[k, d1*D+d2] += Σ_n r[n,k] · xx_flat[n, d1*D+d2]
-        sig_local += tl.dot(tl.trans(r_bf), xx_flat, out_dtype=tl.float32)      # (BLOCK_K, DD)
-
-    # Atomic-add the accumulators back to global. Three atomic groups per CTA total.
-    if K_EXACT:
-        tl.atomic_add(Nk_ptr + k_off, nk_local)
-        tl.atomic_add(
-            mu_acc_ptr + k_off[:, None] * stride_ma_k + d_off[None, :] * stride_ma_d,
-            mu_local,
-        )
-        # Unflatten sig_local (BLOCK_K, DD) → (BLOCK_K, BLOCK_D, BLOCK_D) for the store.
-        sig_3d = tl.reshape(sig_local, (BLOCK_K, BLOCK_D, BLOCK_D))
-        d1_idx = tl.arange(0, BLOCK_D)
-        d2_idx = tl.arange(0, BLOCK_D)
-        sig_off = (k_off[:, None, None] * stride_so_k
-                   + d1_idx[None, :, None] * stride_so_d1
-                   + d2_idx[None, None, :] * stride_so_d2)
-        tl.atomic_add(sig_outer_ptr + sig_off, sig_3d)
-    else:
-        tl.atomic_add(Nk_ptr + k_off, nk_local, mask=k_mask_active)
-        tl.atomic_add(
-            mu_acc_ptr + k_off[:, None] * stride_ma_k + d_off[None, :] * stride_ma_d,
-            mu_local, mask=k_mask_active[:, None],
-        )
-        sig_3d = tl.reshape(sig_local, (BLOCK_K, BLOCK_D, BLOCK_D))
-        d1_idx = tl.arange(0, BLOCK_D)
-        d2_idx = tl.arange(0, BLOCK_D)
-        sig_off = (k_off[:, None, None] * stride_so_k
-                   + d1_idx[None, :, None] * stride_so_d1
-                   + d2_idx[None, None, :] * stride_so_d2)
-        tl.atomic_add(sig_outer_ptr + sig_off, sig_3d, mask=k_mask_active[:, None, None])
+        so_off = (k_off[:, None] * stride_so_k
+                  + d2 * stride_so_d1
+                  + d_off[None, :] * stride_so_d2)
+        tl.atomic_add(sig_outer_ptr + so_off, sig_d2_row, mask=k_mask[:, None])
 
 
 # --------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------
-
-_LOG_2PI = 1.8378770664093453
-_LOG2_E  = 1.4426950408889634
-
-
-def _pick_n_split(N: int) -> int:
-    """Choose N-splits so the (k_blocks × N_SPLIT) total CTA count lands
-    around ~128–512 on H100 (132 SMs)."""
-    if N >= 5_000_000:
-        return 32          # Deep10M
-    if N >= 1_000_000:
-        return 16          # SIFT1M, GloVe
-    return 8
-
 
 def flash_gmm_estep_full(
     X: torch.Tensor,
@@ -357,25 +242,22 @@ def flash_gmm_estep_full(
     Flash-GMM E-step with full covariance.
 
     Args:
-        X:         (N, D)    float32 GPU tensor — data
-        mu:        (K, D)    float32 GPU tensor — component means
-        prec_chol: (K, D, D) float32 GPU tensor — lower-triangular Cholesky
-                   factor of the precision matrix Σ_k^{-1}, i.e.
-                       prec_chol[k] @ prec_chol[k].T = Σ_k^{-1}
-        log_pi:    (K,)      float32 GPU tensor — log mixture weights
+        X:         (N, D)    float32 GPU — data
+        mu:        (K, D)    float32 GPU — component means
+        prec_chol: (K, D, D) float32 GPU — lower-triangular Cholesky factor of
+                   the precision matrix Σ_k^{-1}; prec_chol[k] @ prec_chol[k].T = Σ_k^{-1}
+        log_pi:    (K,)      float32 GPU — log mixture weights
 
     Returns:
-        logZ:           (N,)        float32 — per-sample log-partition function
-        Nk:             (K,)        float32 — Σ_i r_ik
-        mu_acc:         (K, D)      float32 — Σ_i r_ik · x_i
-        sig_outer:      (K, D, D)   float32 — Σ_i r_ik · x_i x_i^T  (uncentered)
+        logZ:      (N,)        float32 — per-sample log-partition function
+        Nk:        (K,)        float32 — Σ_i r_ik
+        mu_acc:    (K, D)      float32 — Σ_i r_ik · x_i
+        sig_outer: (K, D, D)   float32 — Σ_i r_ik · x_i x_i^T  (uncentered second moment)
 
     M-step recovery:
-        π_k    = Nk[k] / N
-        μ_k    = mu_acc[k] / Nk[k]
-        Σ_k    = sig_outer[k] / Nk[k]  -  μ_k μ_k^T
-        Apply your preferred regularization (e.g. Σ_k += ε I) before
-        re-Cholesky-factorizing for the next iteration.
+        π_k = Nk[k] / N
+        μ_k = mu_acc[k] / Nk[k]
+        Σ_k = sig_outer[k] / Nk[k]  -  μ_k μ_k^T
     """
     N, D = X.shape
     K = mu.shape[0]
@@ -384,7 +266,11 @@ def flash_gmm_estep_full(
     assert X.is_cuda and mu.is_cuda
 
     BLOCK_D = max(16, triton.next_power_of_2(D) if D > 0 else 16)
-    DD = BLOCK_D * BLOCK_D
+    # LT (K x D x D) is re-streamed once per N-tile in BOTH passes. Larger
+    # BLOCK_N amortizes those re-reads (the dominant L2/HBM traffic). 256
+    # rows = one full LT sweep per 256 points instead of per 64.
+    BLOCK_N = 256
+    BLOCK_K = 64
 
     # ---- Host-side pad to BLOCK_D when D is not a power of 2 ----
     if D == BLOCK_D:
@@ -399,57 +285,49 @@ def flash_gmm_estep_full(
         L_pad = torch.zeros(K, BLOCK_D, BLOCK_D, device=prec_chol.device, dtype=prec_chol.dtype)
         L_pad[:, :D, :D] = prec_chol
 
-    # ---- Host-side precomputes (run once, reused by both passes) ----
-    # Precision matrix Σ⁻¹_k = L_k L_k^T   (K, BLOCK_D, BLOCK_D)
-    prec = torch.bmm(L_pad, L_pad.transpose(-1, -2))                    # (K, BLOCK_D, BLOCK_D)
-    # Flatten to (K, DD) row-major (d1·BLOCK_D + d2)
-    prec_flat = prec.reshape(K, DD)                                     # (K, DD)
-    # mu_w[k] = Σ⁻¹_k μ_k    (K, BLOCK_D)
-    mu_w = torch.einsum("kij,kj->ki", prec, mu_pad)                     # (K, BLOCK_D)
-    # μ_k^T Σ⁻¹_k μ_k    (K,)
-    mu_quad = (mu_w * mu_pad).sum(dim=1)                                # (K,)
+    # ---- Host-side precomputes ----
+    LT    = L_pad.transpose(-1, -2).contiguous()                  # (K, BLOCK_D, BLOCK_D)
+    LT_mu = torch.einsum("kij,kj->ki", LT, mu_pad).contiguous()    # (K, BLOCK_D)
 
-    # log|Σ⁻¹|^{1/2} = Σ_d log L_kdd. Use the unpadded diagonal (padded rows are zero).
-    log_diag_sum = torch.log(prec_chol.diagonal(dim1=-2, dim2=-1).abs() + 1e-30).sum(dim=-1)  # (K,)
-    # c0 in log2 space: log_pi + log|Σ⁻¹|^{1/2} - 0.5·D·log(2π) - 0.5·μ^TΣ⁻¹μ
-    c0 = ((log_pi + log_diag_sum - 0.5 * D * _LOG_2PI - 0.5 * mu_quad) * _LOG2_E).contiguous()
+    # log|Σ⁻¹|^{1/2} = Σ_d log L_kdd. Use unpadded prec_chol diagonal so
+    # padded-zero rows don't NaN under log.
+    log_diag_sum = torch.log(prec_chol.diagonal(dim1=-2, dim2=-1).abs() + 1e-30).sum(dim=-1)
+    # c0 in log2 space (the -0.5·log2_e·maha term is added in the kernel):
+    c0 = ((log_pi + log_diag_sum - 0.5 * D * _LOG_2PI) * _LOG2_E).contiguous()
 
-    # Pre-transpose for WGMMA-friendly inner matmuls
-    prec_flatT_bf = prec_flat.to(torch.bfloat16).t().contiguous()       # (DD, K)
-    mu_wT_bf      = mu_w.to(torch.bfloat16).t().contiguous()            # (BLOCK_D, K)
+    LT_bf = LT.to(torch.bfloat16).contiguous()                    # (K, BLOCK_D, BLOCK_D)
 
     # ---- Outputs ----
     logZ2 = torch.empty(N, device=X.device, dtype=torch.float32)
-    Nk = torch.zeros(K, device=X.device, dtype=torch.float32)
-    mu_acc_pad    = torch.zeros(K, BLOCK_D, device=X.device, dtype=torch.float32)
-    sig_outer_pad = torch.zeros(K, BLOCK_D, BLOCK_D, device=X.device, dtype=torch.float32)
-
-    K_EXACT = (K % 256 == 0)
-    N_SPLIT = _pick_n_split(N)
+    Nk            = torch.zeros(K,                    device=X.device, dtype=torch.float32)
+    mu_acc_pad    = torch.zeros(K, BLOCK_D,           device=X.device, dtype=torch.float32)
+    sig_outer_pad = torch.zeros(K, BLOCK_D, BLOCK_D,  device=X.device, dtype=torch.float32)
 
     # ---- Pass 1: per-N-tile online LSE ----
-    pass1_grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
-    _full_lse_kernel[pass1_grid](
-        X_pad, prec_flatT_bf, mu_wT_bf, c0, logZ2,
+    grid1 = (triton.cdiv(N, BLOCK_N),)
+    _full_lse_kernel[grid1](
+        X_pad, LT_bf, LT_mu, c0, logZ2,
         N, K, D,
         X_pad.stride(0), X_pad.stride(1),
-        prec_flatT_bf.stride(0), prec_flatT_bf.stride(1),
-        mu_wT_bf.stride(0), mu_wT_bf.stride(1),
-        BLOCK_D=BLOCK_D, DD=DD, K_EXACT=K_EXACT,
+        LT_bf.stride(0), LT_bf.stride(1), LT_bf.stride(2),
+        LT_mu.stride(0), LT_mu.stride(1),
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
+        num_warps=8, num_stages=3,
     )
 
-    # ---- Pass 2: split-K persistent ----
-    pass2_grid = lambda META: (triton.cdiv(K, META["BLOCK_K"]), N_SPLIT)
-    _full_split_k_accum[pass2_grid](
-        X_pad, prec_flatT_bf, mu_wT_bf, c0, logZ2,
+    # ---- Pass 2: 2-D grid over (N-tile, K-tile) ----
+    grid2 = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+    _full_atomic_accum[grid2](
+        X_pad, LT_bf, LT_mu, c0, logZ2,
         Nk, mu_acc_pad, sig_outer_pad,
-        N, K, D, N_SPLIT,
+        N, K, D,
         X_pad.stride(0), X_pad.stride(1),
-        prec_flatT_bf.stride(0), prec_flatT_bf.stride(1),
-        mu_wT_bf.stride(0), mu_wT_bf.stride(1),
+        LT_bf.stride(0), LT_bf.stride(1), LT_bf.stride(2),
+        LT_mu.stride(0), LT_mu.stride(1),
         mu_acc_pad.stride(0), mu_acc_pad.stride(1),
         sig_outer_pad.stride(0), sig_outer_pad.stride(1), sig_outer_pad.stride(2),
-        BLOCK_D=BLOCK_D, DD=DD, K_EXACT=K_EXACT,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
+        num_warps=8, num_stages=3,
     )
 
     mu_acc    = mu_acc_pad[:, :D].contiguous()
