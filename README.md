@@ -128,10 +128,10 @@ For shapes far from the paper benchmarks, or non-H100 GPUs, use `flash_gmm.py`.
 ## Authors
 
 - Gal Bloch (gal.bloch@ibm.com)
-- Assaf Toledo (assaf.toledo@ibm.com)
-- Ohad Eytan (ohad.eytan1@ibm.com)
 - Ariel Gera (ariel.gera1@ibm.com)
 - Matan Orbach (matano@il.ibm.com)
+- Ohad Eytan (ohad.eytan1@ibm.com)
+- Assaf Toledo (assaf.toledo@ibm.com)
 
 IBM Research
 
@@ -141,11 +141,11 @@ If you use Flash-GMM in your research, please cite:
 
 ```bibtex
 @article{bloch2026flashgmm,
-  title     = {Flash-GMM: Breaking the Memory Barrier for Large-Scale
-               Gaussian Mixture Models, with Applications to IVF Indexing},
-  author    = {Bloch, Gal and Toledo, Assaf and Eytan, Ohad and Gera, Ariel and Orbach, Matan},
-  journal   = {arXiv preprint},
-  year      = {2026}
+  title     = {Flash-GMM: A Memory-Efficient Kernel for Scalable Soft Clustering},
+  author    = {Bloch, Gal and Gera, Ariel and Orbach, Matan and Eytan, Ohad and Toledo, Assaf},
+  journal   = {arXiv preprint arXiv:2606.10896},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2606.10896}
 }
 ```
 
